@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { bestEffort, jsonRoute } from "@/lib/route";
 import { llmEnabled, readBill } from "@/lib/llm";
 import { saveBill, uploadImage } from "@/lib/store";
 import { historyFor } from "@/lib/billView";
@@ -6,15 +7,18 @@ import sample from "@/lib/sample.json";
 import type { Extraction } from "@/lib/types";
 
 export const runtime = "nodejs";
+
+// If saving fails the user still gets their result; ids are just not in the database.
+const unsaved = (ex: Extraction) => ({ billId: crypto.randomUUID(), lineIds: ex.lines.map(() => crypto.randomUUID()) });
 export const maxDuration = 60;
 
-export async function POST(req: Request) {
+export const POST = jsonRoute(async (req: Request) => {
   const form = await req.formData();
   const deviceId = String(form.get("deviceId") ?? "anon");
 
   if (form.get("sample") === "1") {
     const ex = sample as unknown as Extraction;
-    const { billId, lineIds } = await saveBill(deviceId, ex, null, "sample");
+    const { billId, lineIds } = await bestEffort("save sample", () => saveBill(deviceId, ex, null, "sample"), unsaved(ex));
     return NextResponse.json({ billId, lineIds, extraction: ex });
   }
 
@@ -29,7 +33,7 @@ export async function POST(req: Request) {
     const { extraction: ex, model } = await readBill(bytes.toString("base64"), mime);
     if (!ex.is_bill || !ex.lines.length)
       return NextResponse.json({ error: "That doesn't look like a bill. Try a clearer, flatter photo." }, { status: 422 });
-    const { billId, lineIds } = await saveBill(deviceId, ex, null, model);
+    const { billId, lineIds } = await bestEffort("save bill", () => saveBill(deviceId, ex, null, model), unsaved(ex));
     // Store the image after we have a row to link it to. A storage hiccup must not lose the result.
     await uploadImage(billId, bytes, mime).catch((e) => console.error(e));
     const history = await historyFor(deviceId, billId, ex).catch(() => ({}));
@@ -43,4 +47,4 @@ export async function POST(req: Request) {
       { status: quota ? 429 : 500 },
     );
   }
-}
+});

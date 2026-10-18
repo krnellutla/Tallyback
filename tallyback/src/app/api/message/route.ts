@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { bestEffort, jsonRoute } from "@/lib/route";
 import { runChecks } from "@/lib/checks";
 import { llmEnabled, writeMessage } from "@/lib/llm";
 import { messagePrompt } from "@/lib/prompts";
@@ -9,7 +10,7 @@ import type { Extraction, Promise } from "@/lib/types";
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-export async function POST(req: Request) {
+export const POST = jsonRoute(async (req: Request) => {
   const body = (await req.json()) as {
     billId: string;
     lineIds: string[];
@@ -46,12 +47,12 @@ export async function POST(req: Request) {
   if (!text) text = templateMessage(facts, body.tone);
 
   const lineItemId = f.lineIndex != null ? (body.lineIds[f.lineIndex] ?? null) : null;
-  const messageId = await saveDraft({
+  const messageId = await bestEffort("save draft", () => saveDraft({
     billId: body.billId,
     lineItemId,
     findingId: body.findingDbIds?.[f.id] ?? null,
     text,
     source,
-  });
+  }), "");
   return NextResponse.json({ messageId, text, source, rejected: stray, findingId: f.id });
-}
+});

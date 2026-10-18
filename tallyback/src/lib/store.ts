@@ -10,8 +10,9 @@ import { maskDigits } from "./mask";
 let sb: SupabaseClient | null | undefined;
 function supabase() {
   if (sb !== undefined) return sb;
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  // Accept the URL however it was pasted: quoted, trailing slash, or with /rest/v1 on the end.
+  const url = process.env.SUPABASE_URL?.trim().replace(/^["']|["']$/g, "").replace(/\/(rest|storage)\/v1\/?.*$/, "").replace(/\/+$/, "");
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim().replace(/^["']|["']$/g, "");
   sb = url && key ? createClient(url, key, { auth: { persistSession: false } }) : null;
   return sb;
 }

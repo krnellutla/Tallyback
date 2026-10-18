@@ -44,10 +44,30 @@ function deviceId(): string {
   }
 }
 
+// Read any reply safely: a timeout or platform error page isn't JSON.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function readJson(r: Response): Promise<any> {
+  const text = await r.text();
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    if (r.status === 413) return { error: "That file is too large. Try a photo instead of a big PDF." };
+    if (r.status === 504 || /timeout/i.test(text)) return { error: "Reading the bill took too long. Please try again." };
+    return { error: `Something went wrong (${r.status}). Please try again.` };
+  }
+}
+
+const MAX_UPLOAD = 4 * 1024 * 1024; // Vercel rejects request bodies over ~4.5 MB
+
 // Phone photos are 3–8 MB; shrink before upload so serverless limits and the free tier are happy.
 async function shrink(file: File): Promise<Blob> {
   if (!file.type.startsWith("image/")) return file;
-  const img = await createImageBitmap(file);
+  let img: ImageBitmap;
+  try {
+    img = await createImageBitmap(file);
+  } catch {
+    return file; // e.g. HEIC on some browsers: send as-is, the server can still read it
+  }
   const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
   const c = document.createElement("canvas");
   c.width = Math.round(img.width * scale);
@@ -97,16 +117,18 @@ export default function Home() {
       fd.append("sample", "1");
       setPreview("/sample-receipt.jpg");
       setIsPdf(false);
-    } else if (file) {
-      const pdf = file.type === "application/pdf";
-      setIsPdf(pdf);
-      setPreview(pdf ? null : URL.createObjectURL(file));
-      const blob = await shrink(file);
-      fd.append("file", blob, pdf ? file.name : "bill.jpg");
     }
     try {
+      if (!sample && file) {
+        const pdf = file.type === "application/pdf";
+        setIsPdf(pdf);
+        setPreview(pdf ? null : URL.createObjectURL(file));
+        const blob = await shrink(file);
+        if (blob.size > MAX_UPLOAD) throw new Error("That file is too large (over 4 MB). Try a photo of the bill instead.");
+        fd.append("file", blob, pdf ? file.name : blob === file ? file.name : "bill.jpg");
+      }
       const r = await fetch("/api/scan", { method: "POST", body: fd });
-      const j = await r.json();
+      const j = await readJson(r);
       if (!r.ok) throw new Error(j.error ?? "Something went wrong");
       setEx(j.extraction);
       setBillId(j.billId);
@@ -131,7 +153,7 @@ export default function Home() {
     setError(null);
     try {
       const r = await fetch(`/api/bills/${id}?deviceId=${encodeURIComponent(deviceId())}`);
-      const j = await r.json();
+      const j = await readJson(r);
       if (!r.ok) throw new Error(j.error ?? "Couldn't open that bill");
       setEx(j.extraction);
       setBillId(j.billId);
@@ -471,8 +493,8 @@ function BillsList({ onOpen, onNew, opening, error }: { onOpen: (id: string) => 
 
   useEffect(() => {
     fetch(`/api/bills?deviceId=${encodeURIComponent(deviceId())}`)
-      .then((r) => r.json())
-      .then((j) => setBills(j.bills ?? []))
+      .then(readJson)
+      .then((j) => (j.error ? setLoadErr(j.error) : setBills(j.bills ?? [])))
       .catch(() => setLoadErr("Couldn't load your bills"));
   }, []);
 
@@ -568,13 +590,13 @@ function MessagePanel(props: {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ billId, deviceId: deviceIdVal, lineIds, extraction: ex, promise }),
-      }).then((r) => r.json());
+      }).then(readJson);
       const r = await fetch("/api/message", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ billId, lineIds, findingDbIds: c.findingIds, extraction: ex, promise, findingId: finding.id, tone, note }),
       });
-      const j = await r.json();
+      const j = await readJson(r);
       if (!r.ok) throw new Error(j.error);
       setDrafted(j.text);
       setText(j.text);
@@ -591,7 +613,7 @@ function MessagePanel(props: {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ messageId, drafted, sentText: text, channel }),
-    }).then((r) => r.json());
+    }).then(readJson);
     setSent(r.wordsChanged ?? 0);
   }
 

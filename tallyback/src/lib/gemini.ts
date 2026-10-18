@@ -14,17 +14,23 @@ function client() {
   return new GoogleGenAI({ apiKey });
 }
 
-const busy = (e: unknown) => /\b(429|500|503)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand/i.test(String(e instanceof Error ? e.message : e));
+const busy = (e: unknown) => /\b(429|500|503)\b|UNAVAILABLE|RESOURCE_EXHAUSTED|overloaded|high demand|abort|timeout/i.test(String(e instanceof Error ? e.message : e));
 
 type GenArgs = Omit<Parameters<GoogleGenAI["models"]["generateContent"]>[0], "model">;
 
+// Leave time for the Groq backup inside Vercel's 60 s function limit.
+const BUDGET_MS = 35_000;
+
 async function generate(args: GenArgs): Promise<{ text: string; model: string }> {
   const ai = client();
-  let last: unknown;
+  const deadline = Date.now() + BUDGET_MS;
+  let last: unknown = new Error("Gemini time budget used up");
   for (const model of [MODEL, ...FALLBACKS]) {
     for (let attempt = 0; attempt < 2; attempt++) {
+      const left = deadline - Date.now();
+      if (left < 3000) throw last;
       try {
-        const res = await ai.models.generateContent({ ...args, model });
+        const res = await ai.models.generateContent({ ...args, model, config: { ...args.config, abortSignal: AbortSignal.timeout(left) } });
         return { text: res.text ?? "", model };
       } catch (e) {
         last = e;

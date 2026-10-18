@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
+import { bestEffort, jsonRoute } from "@/lib/route";
 import { markSent } from "@/lib/store";
 import { wordsChanged } from "@/lib/message";
 
 export const runtime = "nodejs";
 
-export async function POST(req: Request) {
+export const POST = jsonRoute(async (req: Request) => {
   const { messageId, drafted, sentText, channel } = (await req.json()) as {
     messageId: string;
     drafted: string;
@@ -12,6 +13,6 @@ export async function POST(req: Request) {
     channel: string;
   };
   const changed = wordsChanged(drafted, sentText);
-  await markSent(messageId, sentText, changed, channel);
+  if (messageId) await bestEffort("mark sent", () => markSent(messageId, sentText, changed, channel), undefined);
   return NextResponse.json({ wordsChanged: changed });
-}
+});
