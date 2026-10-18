@@ -16,10 +16,12 @@ create table bills (
   printed_tax_total numeric,
   printed_tax_rate_pct numeric,
   printed_total numeric,
+  merchant_contact text,              -- business number printed on the bill, not the customer's
   image_path text,                    -- key in storage bucket "bills"; the row keeps the link
   model text,
   created_at timestamptz not null default now()
 );
+create index on bills (device_id, created_at desc);
 
 create table line_items (
   id uuid primary key,
@@ -31,7 +33,8 @@ create table line_items (
   unit_price numeric,
   amount numeric not null,
   kind text not null,
-  tax_rate_pct numeric
+  tax_rate_pct numeric,
+  box_2d int[]                        -- where the row sits on the photo, for highlights
 );
 create index on line_items (bill_id);
 

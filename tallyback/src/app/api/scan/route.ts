@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { llmEnabled, readBill } from "@/lib/llm";
 import { saveBill, uploadImage } from "@/lib/store";
+import { historyFor } from "@/lib/billView";
 import sample from "@/lib/sample.json";
 import type { Extraction } from "@/lib/types";
 
@@ -31,7 +32,8 @@ export async function POST(req: Request) {
     const { billId, lineIds } = await saveBill(deviceId, ex, null, model);
     // Store the image after we have a row to link it to. A storage hiccup must not lose the result.
     await uploadImage(billId, bytes, mime).catch((e) => console.error(e));
-    return NextResponse.json({ billId, lineIds, extraction: ex });
+    const history = await historyFor(deviceId, billId, ex).catch(() => ({}));
+    return NextResponse.json({ billId, lineIds, extraction: ex, history });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error("scan failed", msg);

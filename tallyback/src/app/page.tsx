@@ -4,9 +4,30 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { runChecks } from "@/lib/checks";
 import { allClearSummary } from "@/lib/message";
 import { fmt } from "@/lib/money";
+import type { LineHistory } from "@/lib/history";
 import type { Extraction, Finding, Promise as BillPromise } from "@/lib/types";
 
-type Stage = "start" | "scanning" | "review";
+type Stage = "start" | "scanning" | "review" | "bills";
+
+interface BillSummary {
+  id: string;
+  merchant: string | null;
+  billType: string | null;
+  billDate: string | null;
+  createdAt: string;
+  currency: string;
+  total: number | null;
+  status: "sent" | "drafted" | "dispute" | "query" | "all_ok";
+  atStake: number;
+  issue: string | null;
+  sentAt: string | null;
+  wordsChanged: number | null;
+}
+
+interface LastMessage {
+  text: string;
+  sentAt: string | null;
+}
 
 const EMPTY_PROMISE: BillPromise = { expectedTotal: null, pricesIncludeTax: null, paidOn: null, lineExpected: {}, unrecognised: [] };
 
@@ -45,6 +66,9 @@ export default function Home() {
   const [ex, setEx] = useState<Extraction | null>(null);
   const [promise, setPromise] = useState<BillPromise>(EMPTY_PROMISE);
   const [selected, setSelected] = useState<number | null>(null);
+  const [history, setHistory] = useState<Record<number, LineHistory>>({});
+  const [lastMessage, setLastMessage] = useState<LastMessage | null>(null);
+  const [opening, setOpening] = useState(false);
   const cameraRef = useRef<HTMLInputElement>(null);
   const uploadRef = useRef<HTMLInputElement>(null);
 
@@ -65,6 +89,8 @@ export default function Home() {
     setStage("scanning");
     setPromise(EMPTY_PROMISE);
     setSelected(null);
+    setHistory({});
+    setLastMessage(null);
     const fd = new FormData();
     fd.append("deviceId", deviceId());
     if (sample) {
@@ -85,6 +111,7 @@ export default function Home() {
       setEx(j.extraction);
       setBillId(j.billId);
       setLineIds(j.lineIds);
+      setHistory(j.history ?? {});
       setStage("review");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -99,9 +126,34 @@ export default function Home() {
     setError(null);
   }
 
+  async function openBill(id: string) {
+    setOpening(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/bills/${id}?deviceId=${encodeURIComponent(deviceId())}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error ?? "Couldn't open that bill");
+      setEx(j.extraction);
+      setBillId(j.billId);
+      setLineIds(j.lineIds);
+      setPromise(j.promise);
+      setPreview(j.imageUrl);
+      setIsPdf(!j.imageUrl);
+      setHistory(j.history ?? {});
+      setLastMessage(j.lastMessage);
+      setSelected(null);
+      setStage("review");
+      window.scrollTo(0, 0);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setOpening(false);
+    }
+  }
+
   return (
     <main className="mx-auto min-h-dvh max-w-xl px-4 pb-24 pt-6">
-      <header className="mb-6 flex items-center justify-between">
+      <header className="mb-6 flex items-center justify-between gap-3">
         <button onClick={reset} className="flex items-center gap-2.5 text-left">
           <Logo />
           <span className="flex flex-col leading-tight">
@@ -109,9 +161,13 @@ export default function Home() {
             <span className="text-xs text-muted">One place to store your bills for the future</span>
           </span>
         </button>
-        {stage === "review" && (
-          <button onClick={reset} className="text-sm text-muted underline underline-offset-4">
-            New bill
+        {stage === "bills" ? (
+          <button onClick={reset} className="shrink-0 rounded-full bg-ink px-3 py-1.5 text-sm font-medium text-white">
+            + New bill
+          </button>
+        ) : (
+          <button onClick={() => setStage("bills")} className="shrink-0 rounded-full border border-line bg-card px-3 py-1.5 text-sm font-medium">
+            My bills
           </button>
         )}
       </header>
@@ -152,6 +208,8 @@ export default function Home() {
         </section>
       )}
 
+      {stage === "bills" && <BillsList onOpen={openBill} onNew={reset} opening={opening} error={error} />}
+
       {stage === "review" && ex && result && (
         <Review
           ex={ex}
@@ -165,6 +223,8 @@ export default function Home() {
           setSelected={setSelected}
           billId={billId}
           lineIds={lineIds}
+          history={history}
+          lastMessage={lastMessage}
         />
       )}
     </main>
@@ -183,8 +243,10 @@ function Review(props: {
   setSelected: (i: number | null) => void;
   billId: string;
   lineIds: string[];
+  history: Record<number, LineHistory>;
+  lastMessage: LastMessage | null;
 }) {
-  const { ex, result, flagged, promise, setPromise, selected, setSelected } = props;
+  const { ex, result, flagged, promise, setPromise, selected, setSelected, history, lastMessage } = props;
   const cur = ex.currency ?? "";
   const p = result.primary;
   const infos = result.findings.filter((f) => f.verdict === "info");
@@ -193,6 +255,11 @@ function Review(props: {
 
   return (
     <section className="space-y-5">
+      {lastMessage?.sentAt && (
+        <div className="rounded-2xl bg-good-soft p-3 text-sm text-good">
+          You sent a message about this bill on {new Date(lastMessage.sentAt).toLocaleDateString("en-GB", { day: "numeric", month: "short" })}.
+        </div>
+      )}
       {/* Bill with highlighted rows */}
       <div className="rounded-2xl border border-line bg-card p-3">
         <div className="mb-3 flex items-baseline justify-between px-1">
@@ -329,6 +396,11 @@ function Review(props: {
                       {l.qty != null && l.unit_price != null && l.kind === "item" ? `${l.qty} × ${fmt(l.unit_price, cur)} · ` : ""}
                       {l.plain_words}
                     </p>
+                    {history[i] && (
+                      <p className={`mt-0.5 text-xs ${history[i].change === "up" ? "font-medium text-warn" : "text-muted"}`}>
+                        ↺ {history[i].note}
+                      </p>
+                    )}
                   </div>
                   <span className={`font-mono text-sm ${v === "wrong" || v === "unexplained" ? "font-semibold text-bad" : ""}`}>{fmt(l.amount, cur)}</span>
                 </button>
@@ -381,6 +453,78 @@ function Review(props: {
       </details>
 
       {p && <MessagePanel key={p.id} {...props} finding={p} />}
+    </section>
+  );
+}
+
+const STATUS: Record<BillSummary["status"], { label: string; cls: string }> = {
+  sent: { label: "Message sent", cls: "bg-good-soft text-good" },
+  drafted: { label: "Message drafted", cls: "bg-warn-soft text-warn" },
+  dispute: { label: "Doesn't add up", cls: "bg-bad-soft text-bad" },
+  query: { label: "Unexplained charge", cls: "bg-warn-soft text-warn" },
+  all_ok: { label: "Checks out", cls: "bg-paper text-muted" },
+};
+
+function BillsList({ onOpen, onNew, opening, error }: { onOpen: (id: string) => void; onNew: () => void; opening: boolean; error: string | null }) {
+  const [bills, setBills] = useState<BillSummary[] | null>(null);
+  const [loadErr, setLoadErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch(`/api/bills?deviceId=${encodeURIComponent(deviceId())}`)
+      .then((r) => r.json())
+      .then((j) => setBills(j.bills ?? []))
+      .catch(() => setLoadErr("Couldn't load your bills"));
+  }, []);
+
+  const recovered = (bills ?? []).filter((b) => b.status === "sent").reduce<Record<string, number>>((acc, b) => {
+    acc[b.currency] = (acc[b.currency] ?? 0) + b.atStake;
+    return acc;
+  }, {});
+
+  return (
+    <section>
+      <h1 className="text-2xl font-semibold tracking-tight">My bills</h1>
+      <p className="mt-1 text-sm text-muted">Every bill you&apos;ve checked on this phone, kept for next time.</p>
+      {Object.entries(recovered).some(([, v]) => v > 0) && (
+        <p className="mt-3 rounded-xl bg-good-soft p-3 text-sm text-good">
+          Disputed so far: {Object.entries(recovered).filter(([, v]) => v > 0).map(([c, v]) => fmt(v, c)).join(" + ")}
+        </p>
+      )}
+      {(error || loadErr) && <p className="mt-4 rounded-xl bg-bad-soft p-3 text-sm text-bad">{error ?? loadErr}</p>}
+      {bills === null && !loadErr && <p className="mt-6 text-muted">Loading…</p>}
+      {bills?.length === 0 && (
+        <div className="mt-6 rounded-2xl border border-dashed border-line p-6 text-center">
+          <p className="font-medium">No bills yet</p>
+          <p className="mt-1 text-sm text-muted">Bills you scan show up here.</p>
+          <button onClick={onNew} className="mt-4 h-11 rounded-xl bg-ink px-5 text-sm font-medium text-white">
+            Check a bill
+          </button>
+        </div>
+      )}
+      <ul className={`mt-5 space-y-3 ${opening ? "pointer-events-none opacity-60" : ""}`}>
+        {bills?.map((b) => {
+          const st = STATUS[b.status];
+          const date = b.billDate ?? b.createdAt.slice(0, 10);
+          return (
+            <li key={b.id}>
+              <button onClick={() => onOpen(b.id)} className="w-full rounded-2xl border border-line bg-card p-4 text-left active:scale-[.99]">
+                <div className="flex items-baseline justify-between gap-3">
+                  <p className="truncate font-medium">{b.merchant ?? "Bill"}</p>
+                  {b.total != null && <p className="shrink-0 font-mono">{fmt(b.total, b.currency)}</p>}
+                </div>
+                <p className="mt-0.5 text-xs text-muted">
+                  {[new Date(date + "T00:00:00").toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" }), b.billType].filter(Boolean).join(" · ")}
+                </p>
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <span className={`rounded-full px-2.5 py-1 font-medium ${st.cls}`}>{st.label}</span>
+                  {b.atStake > 0 && b.status !== "all_ok" && <span className="font-mono text-muted">{fmt(b.atStake, b.currency)} at stake</span>}
+                  {b.status === "sent" && b.wordsChanged != null && <span className="text-muted">{b.wordsChanged} words changed</span>}
+                </div>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
     </section>
   );
 }
