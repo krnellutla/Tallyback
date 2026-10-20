@@ -1,54 +1,49 @@
 import "server-only";
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { neon } from "@neondatabase/serverless";
+import { get as blobGet, put as blobPut } from "@vercel/blob";
 import { promises as fs } from "fs";
 import os from "os";
 import path from "path";
 import type { CheckResult, Extraction, ExtractedLine, Promise as BillPromise } from "./types";
 import { maskDigits } from "./mask";
+import { SCHEMA, TABLES, type Table } from "./db/schema";
 
-// Supabase when configured; otherwise a local JSON file so the app runs with zero setup.
-let sb: SupabaseClient | null | undefined;
-function supabase() {
-  if (sb !== undefined) return sb;
-  // Accept the URL however it was pasted: quoted, trailing slash, or with /rest/v1 on the end.
-  const url = process.env.SUPABASE_URL?.trim().replace(/^["']|["']$/g, "").replace(/\/(rest|storage)\/v1\/?.*$/, "").replace(/\/+$/, "");
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim().replace(/^["']|["']$/g, "");
-  sb = url && key ? createClient(url, key, { auth: { persistSession: false } }) : null;
-  return sb;
-}
-
+// Postgres (Neon) when DATABASE_URL is set; otherwise a local JSON file so the app runs with zero setup.
+// Photos go to private Vercel Blob when BLOB_READ_WRITE_TOKEN is set.
 type Row = Record<string, unknown>;
-const DB_FILE = path.join(process.env.VERCEL ? os.tmpdir() : process.cwd(), ".data", "db.json");
+type Sql = ReturnType<typeof neon>;
 
-async function localInsert(table: string, rows: Row[]) {
-  await fs.mkdir(path.dirname(DB_FILE), { recursive: true });
-  let db: Record<string, Row[]> = {};
-  try {
-    db = JSON.parse(await fs.readFile(DB_FILE, "utf8"));
-  } catch {}
-  db[table] = [...(db[table] ?? []), ...rows];
-  await fs.writeFile(DB_FILE, JSON.stringify(db, null, 2));
-}
+const dbUrl = () => (process.env.DATABASE_URL || process.env.POSTGRES_URL || "").trim().replace(/^["']|["']$/g, "");
+let sqlClient: Sql | null | undefined;
+let schemaReady: Promise<void> | null = null;
 
-async function localUpdate(table: string, id: string, patch: Row) {
-  const db: Record<string, Row[]> = JSON.parse(await fs.readFile(DB_FILE, "utf8"));
-  db[table] = (db[table] ?? []).map((r) => (r.id === id ? { ...r, ...patch } : r));
-  await fs.writeFile(DB_FILE, JSON.stringify(db, null, 2));
-}
-
-// Columns added by migrations-001; dropped on insert if the migration hasn't been run yet.
-const OPTIONAL_COLS = ["box_2d", "merchant_contact"];
-
-async function insert(table: string, rows: Row[]) {
-  const s = supabase();
-  if (!s) return localInsert(table, rows);
-  let { error } = await s.from(table).insert(rows);
-  if (error && OPTIONAL_COLS.some((c) => error!.message.includes(c))) {
-    console.warn(`${table}: run supabase/migrations-001-my-bills.sql (${error.message})`);
-    ({ error } = await s.from(table).insert(rows.map((r) => Object.fromEntries(Object.entries(r).filter(([k]) => !OPTIONAL_COLS.includes(k))))));
+async function db(): Promise<Sql | null> {
+  if (sqlClient === undefined) sqlClient = dbUrl() ? neon(dbUrl()) : null;
+  if (sqlClient && !schemaReady) {
+    const sql = sqlClient;
+    schemaReady = (async () => {
+      for (const stmt of SCHEMA) await sql.query(stmt);
+    })().catch((e) => {
+      schemaReady = null; // retry on the next request
+      throw e;
+    });
   }
-  if (error) throw new Error(`${table}: ${error.message}`);
+  if (sqlClient) await schemaReady;
+  return sqlClient;
 }
+
+const assertTable = (t: string): Table => {
+  if (!(TABLES as readonly string[]).includes(t)) throw new Error(`unknown table ${t}`);
+  return t as Table;
+};
+
+// Read rows back as JSON so dates are "YYYY-MM-DD", timestamps ISO strings and arrays arrays.
+async function selectJson(sql: Sql, query: string, params: unknown[]): Promise<Row[]> {
+  const rows = (await sql.query(`select coalesce(json_agg(t), '[]'::json) as rows from (${query}) t`, params)) as { rows: Row[] }[];
+  return rows[0]?.rows ?? [];
+}
+
+const DB_FILE = path.join(process.env.VERCEL ? os.tmpdir() : process.cwd(), ".data", "db.json");
 
 async function localAll(): Promise<Record<string, Row[]>> {
   try {
@@ -58,25 +53,83 @@ async function localAll(): Promise<Record<string, Row[]>> {
   }
 }
 
+async function localWrite(data: Record<string, Row[]>) {
+  await fs.mkdir(path.dirname(DB_FILE), { recursive: true });
+  await fs.writeFile(DB_FILE, JSON.stringify(data, null, 2));
+}
+
+async function insert(table: string, rows: Row[]) {
+  const t = assertTable(table);
+  const sql = await db();
+  if (!sql) {
+    const data = await localAll();
+    data[t] = [...(data[t] ?? []), ...rows];
+    return localWrite(data);
+  }
+  // One statement for any number of rows; column types come from the table itself.
+  await sql.query(`insert into ${t} select * from json_populate_recordset(null::${t}, $1::json)`, [JSON.stringify(rows)]);
+}
+
 async function update(table: string, id: string, patch: Row) {
-  const s = supabase();
-  if (!s) return localUpdate(table, id, patch);
-  const { error } = await s.from(table).update(patch).eq("id", id);
-  if (error) throw new Error(`${table}: ${error.message}`);
+  const t = assertTable(table);
+  const sql = await db();
+  if (!sql) {
+    const data = await localAll();
+    data[t] = (data[t] ?? []).map((r) => (r.id === id ? { ...r, ...patch } : r));
+    return localWrite(data);
+  }
+  await sql.query(
+    `update ${t} u set ${Object.keys(patch)
+      .map((k) => `${k.replace(/[^a-z_]/g, "")} = p.${k.replace(/[^a-z_]/g, "")}`)
+      .join(", ")} from json_populate_record(null::${t}, $2::json) p where u.id = $1`,
+    [id, JSON.stringify(patch)],
+  );
 }
 
 const now = () => new Date().toISOString();
 const uuid = () => crypto.randomUUID();
 
+const DB_PHOTO = "db:"; // image_path prefix for photos kept in the bill_photos table
+
+// Private Blob when configured, else the bill_photos table, else (local dev) not kept.
 export async function uploadImage(billId: string, bytes: Buffer, mime: string): Promise<string | null> {
-  const s = supabase();
-  if (!s) return null; // local mode: we don't keep the image
-  const ext = mime.includes("pdf") ? "pdf" : "jpg";
-  const p = `${billId}.${ext}`;
-  const { error } = await s.storage.from("bills").upload(p, bytes, { contentType: mime, upsert: true });
-  if (error) throw new Error(`storage: ${error.message}`);
-  await update("bills", billId, { image_path: p }); // the row keeps the link to the file
-  return p;
+  let link: string;
+  if (process.env.BLOB_READ_WRITE_TOKEN) {
+    const ext = mime.includes("pdf") ? "pdf" : "jpg";
+    link = (await blobPut(`bills/${billId}.${ext}`, bytes, { access: "private", contentType: mime, allowOverwrite: true })).pathname;
+  } else {
+    const sql = await db();
+    if (!sql) return null;
+    await sql.query(
+      `insert into bill_photos (bill_id, content_type, bytes) values ($1, $2, decode($3, 'base64'))
+       on conflict (bill_id) do update set content_type = excluded.content_type, bytes = excluded.bytes`,
+      [billId, mime, bytes.toString("base64")],
+    );
+    link = DB_PHOTO + billId;
+  }
+  await update("bills", billId, { image_path: link }); // the row keeps the link to the file
+  return link;
+}
+
+// Stream a private photo back, only to the device that owns the bill.
+export async function readImage(billId: string, deviceId: string): Promise<{ stream: ReadableStream; type: string } | null> {
+  const b = await getBillRow(billId, deviceId);
+  const p = b?.image_path;
+  if (typeof p !== "string") return null;
+  if (p.startsWith(DB_PHOTO)) {
+    const sql = await db();
+    if (!sql) return null;
+    const rows = (await sql.query(`select content_type, encode(bytes, 'base64') as b64 from bill_photos where bill_id = $1`, [
+      p.slice(DB_PHOTO.length),
+    ])) as { content_type: string; b64: string }[];
+    if (!rows[0]) return null;
+    const bytes = Buffer.from(rows[0].b64, "base64");
+    return { stream: new Blob([bytes]).stream(), type: rows[0].content_type };
+  }
+  if (!process.env.BLOB_READ_WRITE_TOKEN) return null;
+  const res = await blobGet(p, { access: "private" });
+  if (!res?.stream) return null;
+  return { stream: res.stream, type: res.blob.contentType ?? "image/jpeg" };
 }
 
 export async function saveBill(deviceId: string, ex: Extraction, imagePath: string | null, model: string) {
@@ -246,29 +299,38 @@ export function toPromise(p: Row | null): BillPromise {
 const newest = (rows: Row[]) => [...rows].sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
 
 export async function listBills(deviceId: string, limit = 50): Promise<StoredBill[]> {
-  const s = supabase();
-  if (!s) {
-    const db = await localAll();
-    return newest((db.bills ?? []).filter((b) => b.device_id === deviceId))
+  const sql = await db();
+  if (!sql) {
+    const data = await localAll();
+    return newest((data.bills ?? []).filter((b) => b.device_id === deviceId))
       .slice(0, limit)
       .map((b) => ({
         bill: b,
-        lines: (db.line_items ?? []).filter((l) => l.bill_id === b.id),
-        promise: newest((db.promises ?? []).filter((p) => p.bill_id === b.id))[0] ?? null,
-        messages: newest((db.messages ?? []).filter((m) => m.bill_id === b.id)),
+        lines: (data.line_items ?? []).filter((l) => l.bill_id === b.id),
+        promise: newest((data.promises ?? []).filter((p) => p.bill_id === b.id))[0] ?? null,
+        messages: newest((data.messages ?? []).filter((m) => m.bill_id === b.id)),
       }));
   }
-  const { data, error } = await s
-    .from("bills")
-    .select("*, line_items(*), promises(*), messages(*)")
-    .eq("device_id", deviceId)
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (error) throw new Error(`bills: ${error.message}`);
-  return (data ?? []).map((b: Row) => {
-    const { line_items, promises, messages, ...bill } = b as Row & { line_items: Row[]; promises: Row[]; messages: Row[] };
-    return { bill, lines: line_items ?? [], promise: newest(promises ?? [])[0] ?? null, messages: newest(messages ?? []) };
-  });
+  const bills = await selectJson(sql, `select * from bills where device_id = $1 order by created_at desc limit $2`, [deviceId, limit]);
+  if (!bills.length) return [];
+  const ids = bills.map((b) => b.id);
+  const [lines, promises, messages] = await Promise.all(
+    (["line_items", "promises", "messages"] as const).map((t) => selectJson(sql, `select * from ${t} where bill_id = any($1::uuid[])`, [ids])),
+  );
+  const by = (rows: Row[], id: unknown) => rows.filter((r) => r.bill_id === id);
+  return bills.map((bill) => ({
+    bill,
+    lines: by(lines, bill.id),
+    promise: newest(by(promises, bill.id))[0] ?? null,
+    messages: newest(by(messages, bill.id)),
+  }));
+}
+
+async function getBillRow(id: string, deviceId: string): Promise<Row | null> {
+  const sql = await db();
+  if (!sql) return ((await localAll()).bills ?? []).find((b) => b.id === id && b.device_id === deviceId) ?? null;
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return null;
+  return (await selectJson(sql, `select * from bills where id = $1 and device_id = $2`, [id, deviceId]))[0] ?? null;
 }
 
 export async function getBill(id: string, deviceId: string): Promise<StoredBill | null> {
@@ -276,11 +338,11 @@ export async function getBill(id: string, deviceId: string): Promise<StoredBill 
   return all.find((b) => b.bill.id === id) ?? null;
 }
 
-export async function signedImageUrl(imagePath: unknown): Promise<string | null> {
-  const s = supabase();
-  if (!s || typeof imagePath !== "string" || imagePath.endsWith(".pdf")) return null;
-  const { data } = await s.storage.from("bills").createSignedUrl(imagePath, 3600);
-  return data?.signedUrl ?? null;
+// Photos are private: the page asks our server, which checks the device before streaming it.
+export function photoUrl(bill: Row, deviceId: string): string | null {
+  const p = bill.image_path;
+  if (typeof p !== "string" || p.endsWith(".pdf")) return null;
+  return `/api/bills/${bill.id}/photo?deviceId=${encodeURIComponent(deviceId)}`;
 }
 
 // Earlier lines from the same shop, on this device, for "has this shown up before?"

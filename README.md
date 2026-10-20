@@ -43,25 +43,25 @@ A language model will happily add up a bill for you, and be confidently wrong by
 Phone (camera / upload) ──► Server (Vercel, keys live here)
                                ├─► AI: photo → lines + row positions;  message words with {{placeholders}}
                                ├─► Code: every check, every amount, the verdict, the verifier
-                               └─► Supabase: bills, lines, promises, findings, messages → line item
+                               └─► Neon Postgres: bills, lines, promises, findings, messages → line item; photos in private Vercel Blob
 ```
 
 ## Built with
 
-Next.js 15 · TypeScript · Tailwind CSS · Google Gemini (`gemini-3.8-flash`, with fallbacks) · Groq (`qwen3.8-27b` vision, `gpt-oss-20b` text) as a backup · Supabase (Postgres + private Storage, RLS on) · Vercel
+Next.js 15 · TypeScript · Tailwind CSS · Google Gemini (`gemini-3.8-flash`, with fallbacks) · Groq (`qwen3.8-27b` vision, `gpt-oss-20b` text) as a backup · Neon Postgres · Vercel Blob (private) · Vercel
 
 ## Run it yourself
 
 ```bash
 git clone https://github.com/krnellutla/Tallyback.git
 cd Tallyback/tallyback
-cp .env.example .env.local   # add a free Gemini key (aistudio.google.com/apikey); Groq and Supabase are optional
+cp .env.example .env.local   # add a free Gemini key (aistudio.google.com/apikey); Groq, Neon and Blob are optional
 npm install
 npm run dev                  # http://localhost:3000
 npm test                     # 21 tests, including real receipt scans
 ```
 
-Without Supabase, data is saved to a local file. For Supabase, run [`supabase/schema.sql`](tallyback/supabase/schema.sql) (or the migration on an older database) and create a private bucket named `bills`. Developer details are in [`tallyback/README.md`](tallyback/README.md).
+Without a database, data is saved to a local file. With `DATABASE_URL` (Neon Postgres), tables are created automatically on first use. Developer details are in [`tallyback/README.md`](tallyback/README.md).
 
 ## Repository
 

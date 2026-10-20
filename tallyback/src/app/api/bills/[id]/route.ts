@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { jsonRoute } from "@/lib/route";
-import { getBill, signedImageUrl, toExtraction, toPromise } from "@/lib/store";
+import { getBill, photoUrl, toExtraction, toPromise } from "@/lib/store";
 import { historyFor, summarise } from "@/lib/billView";
 
 export const runtime = "nodejs";
@@ -17,7 +17,7 @@ export const GET = jsonRoute(async (req: Request, { params }: { params: Promise<
     lineIds,
     extraction,
     promise: toPromise(b.promise),
-    imageUrl: await signedImageUrl(b.bill.image_path),
+    imageUrl: photoUrl(b.bill, deviceId),
     history: await historyFor(deviceId, id, extraction),
     summary: summarise(b),
     lastMessage: b.messages[0] ? { text: (b.messages[0].sent_text ?? b.messages[0].drafted_text) as string, sentAt: b.messages[0].sent_at ?? null } : null,
